@@ -1,4 +1,5 @@
 import random
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,6 +11,8 @@ from model.utils.config import cfg
 from model.rpn.rpn import _RPN
 
 from model.roi_layers import ROIAlign, ROIPool
+from model.memory_bank.memory_bank import Memory
+from model.loss.TripletLoss import TripletLoss
 
 # from model.roi_pooling.modules.roi_pool import _RoIPooling
 # from model.roi_align.modules.roi_align import RoIAlignAvg
@@ -40,12 +43,20 @@ class _fasterRCNN(nn.Module):
         self.RCNN_roi_pool = ROIPool((cfg.POOLING_SIZE, cfg.POOLING_SIZE), 1.0/16.0)
         self.RCNN_roi_align = ROIAlign((cfg.POOLING_SIZE, cfg.POOLING_SIZE), 1.0/16.0, 0)
 
+        # use memory bank
+
+        self.memory = Memory(self.classes, self.n_classes)
+
     def forward(self, im_data, im_info, gt_boxes, num_boxes):
+        # print('1:{}'.format(torch.cuda.memory_allocated(0)))
         batch_size = im_data.size(0)
 
         im_info = im_info.data
         gt_boxes = gt_boxes.data
         num_boxes = num_boxes.data
+        
+        # print('im_info:{}, gt_boxes:{}, num_boxes:{}'.format(im_info.shape, gt_boxes.shape, num_boxes.shape))
+        # im_info:torch.Size([4, 3]), gt_boxes:torch.Size([4, 20, 5]), num_boxes:torch.Size([4])
 
         # feed image data to base model to obtain base feature map
         base_feat = self.RCNN_base(im_data)
@@ -53,15 +64,29 @@ class _fasterRCNN(nn.Module):
         # feed base feature map tp RPN to obtain rois
         rois, rpn_loss_cls, rpn_loss_bbox = self.RCNN_rpn(base_feat, im_info, gt_boxes, num_boxes)
 
+        # print('rois:{}, rpn_loss:{}, rpn_loss_bbox:{}'.format(rois.shape, rpn_loss_cls.shape, rpn_loss_bbox.shape))
+        # rois:torch.Size([4, 2000, 5]), rpn_loss:torch.Size([]), rpn_loss_bbox:torch.Size([])
+
         # if it is training phrase, then use ground trubut bboxes for refining
         if self.training:
-            roi_data = self.RCNN_proposal_target(rois, gt_boxes, num_boxes)
-            rois, rois_label, rois_target, rois_inside_ws, rois_outside_ws = roi_data
 
+            roi_data = self.RCNN_proposal_target(rois, gt_boxes, num_boxes)
+            rois, rois_label, rois_target, rois_inside_ws, rois_outside_ws, tri_rois_label, tri_rois = roi_data
+            
+
+            # print('tri_labels:{}, tri_rois:{}'.format(tri_labels.shape, tri_rois.shape))
+            # tri_labels:torch.Size([4, 10]), tri_rois:torch.Size([4, 10, 5])
+            # print('rois:{} rois_label:{} rois_target:{}, rois_in_ws:{}, rois_out_ws:{}'.format(rois.shape, rois_label.shape, rois_target.shape, rois_inside_ws.shape, rois_outside_ws.shape))
+            # rois:torch.Size([4, 128, 5]) rois_label:torch.Size([4, 128]) rois_target:torch.Size([4, 128, 4]), rois_in_ws:torch.Size([4, 128, 4]), rois_out_ws:torch.Size([4, 128, 4])
+            
             rois_label = Variable(rois_label.view(-1).long())
+            tri_rois_label = Variable(tri_rois_label.view(-1).long())
             rois_target = Variable(rois_target.view(-1, rois_target.size(2)))
             rois_inside_ws = Variable(rois_inside_ws.view(-1, rois_inside_ws.size(2)))
             rois_outside_ws = Variable(rois_outside_ws.view(-1, rois_outside_ws.size(2)))
+
+            # print('rois_label:{}, rois_target:{}'.format(rois_label.shape, rois_target.shape))
+            # rois_label:torch.Size([512]), rois_target:torch.Size([512, 4])
         else:
             rois_label = None
             rois_target = None
@@ -72,14 +97,35 @@ class _fasterRCNN(nn.Module):
 
         rois = Variable(rois)
         # do roi pooling based on predicted rois
+        #print('base feature shape:{}'.format(base_feat.shape))
 
+        
         if cfg.POOLING_MODE == 'align':
             pooled_feat = self.RCNN_roi_align(base_feat, rois.view(-1, 5))
+            tri_pooled_feat = self.RCNN_roi_align(base_feat, tri_rois.view(-1, 5))
         elif cfg.POOLING_MODE == 'pool':
             pooled_feat = self.RCNN_roi_pool(base_feat, rois.view(-1,5))
+            tri_pooled_feat = self.RCNN_roi_pool(base_feat, tri_rois.view(-1, 5))
+
+        
+
+        # print('pooled_feat shape before head {}'.format(pooled_feat.shape))
+        # pooled_feat shape before head torch.Size([256, 1024, 7, 7])
+        # print('tri_pooled_feat:{}'.format(tri_pooled_feat.shape))
+        # tri_pooled_feat:torch.Size([20, 1024, 7, 7])
 
         # feed pooled features to top model
+        tmp = pooled_feat.shape[0]
+        pooled_feat = torch.cat([pooled_feat, tri_pooled_feat], dim=0)
+
         pooled_feat = self._head_to_tail(pooled_feat)
+
+        tri_pooled_feat = pooled_feat[tmp:]
+        pooled_feat = pooled_feat[0:tmp]
+        
+        # print('tri_pooled_feat:{}, pooled_feat:{}'.format(tri_pooled_feat.shape, pooled_feat.shape))
+        
+        # print('pooled_feat shape:{}'.format(pooled_feat.shape))
 
         # compute bbox offset
         bbox_pred = self.RCNN_bbox_pred(pooled_feat)
@@ -89,25 +135,33 @@ class _fasterRCNN(nn.Module):
             bbox_pred_select = torch.gather(bbox_pred_view, 1, rois_label.view(rois_label.size(0), 1, 1).expand(rois_label.size(0), 1, 4))
             bbox_pred = bbox_pred_select.squeeze(1)
 
-        # compute object classification probability
-        cls_score = self.RCNN_cls_score(pooled_feat)
-        cls_prob = F.softmax(cls_score, 1)
 
-        RCNN_loss_cls = 0
+        # memory bank
+        cls_prob, RCNN_cls_acc = self.memory(tri_pooled_feat, tri_rois_label.view(tri_pooled_feat.shape[0], -1))
+
+        # compute similarity and triplet loss
+        RCNN_loss_triplet = TripletLoss(tri_pooled_feat, tri_rois_label)
+        #RCNN_loss_triplet = torch.tensor(0.0)
+
+        # compute object classification probability
+        #cls_score = self.RCNN_cls_score(pooled_feat)
+        #cls_prob = F.softmax(cls_score, 1)
+
+        #RCNN_loss_cls = 0
         RCNN_loss_bbox = 0
 
         if self.training:
             # classification loss
-            RCNN_loss_cls = F.cross_entropy(cls_score, rois_label)
+            #RCNN_loss_cls = F.cross_entropy(cls_score, rois_label)
 
             # bounding box regression L1 loss
             RCNN_loss_bbox = _smooth_l1_loss(bbox_pred, rois_target, rois_inside_ws, rois_outside_ws)
 
 
-        cls_prob = cls_prob.view(batch_size, rois.size(1), -1)
+        cls_prob = cls_prob.view(batch_size, tri_rois.size(1), -1)
         bbox_pred = bbox_pred.view(batch_size, rois.size(1), -1)
 
-        return rois, cls_prob, bbox_pred, rpn_loss_cls, rpn_loss_bbox, RCNN_loss_cls, RCNN_loss_bbox, rois_label
+        return rois, cls_prob, bbox_pred, rpn_loss_cls, rpn_loss_bbox, RCNN_loss_triplet, RCNN_loss_bbox, rois_label, RCNN_cls_acc, tri_rois, tri_rois_label
 
     def _init_weights(self):
         def normal_init(m, mean, stddev, truncated=False):

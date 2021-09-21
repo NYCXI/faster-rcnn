@@ -234,6 +234,7 @@ if __name__ == '__main__':
     cfg.CUDA = True
 
   # initilize the network here.
+  print('imdb.classes:{}'.format(imdb.classes))
   if args.net == 'vgg16':
     fasterRCNN = vgg16(imdb.classes, pretrained=True, class_agnostic=args.class_agnostic)
   elif args.net == 'res101':
@@ -315,13 +316,15 @@ if __name__ == '__main__':
               num_boxes.resize_(data[3].size()).copy_(data[3])
 
       fasterRCNN.zero_grad()
+
       rois, cls_prob, bbox_pred, \
       rpn_loss_cls, rpn_loss_box, \
-      RCNN_loss_cls, RCNN_loss_bbox, \
-      rois_label = fasterRCNN(im_data, im_info, gt_boxes, num_boxes)
+      RCNN_loss_triplet, RCNN_loss_bbox, \
+      rois_label, RCNN_cls_acc, \
+      tri_rois, tri_rois_label = fasterRCNN(im_data, im_info, gt_boxes, num_boxes)
 
-      loss = rpn_loss_cls.mean() + rpn_loss_box.mean() \
-           + RCNN_loss_cls.mean() + RCNN_loss_bbox.mean()
+      loss = rpn_loss_cls.mean() + rpn_loss_box.mean() + RCNN_loss_bbox.mean() + 0.1 * RCNN_loss_triplet.mean()
+      
       loss_temp += loss.item()
 
       # backward
@@ -339,30 +342,39 @@ if __name__ == '__main__':
         if args.mGPUs:
           loss_rpn_cls = rpn_loss_cls.mean().item()
           loss_rpn_box = rpn_loss_box.mean().item()
-          loss_rcnn_cls = RCNN_loss_cls.mean().item()
+          #loss_rcnn_cls = RCNN_loss_cls.mean().item()
           loss_rcnn_box = RCNN_loss_bbox.mean().item()
+          loss_rcnn_triplet = RCNN_loss_triplet.mean().item()
           fg_cnt = torch.sum(rois_label.data.ne(0))
+          tri_fg_cnt = torch.sum(tri_rois_label.data.ne(0))
           bg_cnt = rois_label.data.numel() - fg_cnt
+          tri_bg_cnt = tri_rois_label.data.numel() - tri_fg_cnt
         else:
           loss_rpn_cls = rpn_loss_cls.item()
           loss_rpn_box = rpn_loss_box.item()
-          loss_rcnn_cls = RCNN_loss_cls.item()
+          #loss_rcnn_cls = RCNN_loss_cls.item()
+          rcnn_cls_acc = RCNN_cls_acc.item()
           loss_rcnn_box = RCNN_loss_bbox.item()
+          loss_rcnn_triplet = RCNN_loss_triplet.item()
           fg_cnt = torch.sum(rois_label.data.ne(0))
+          tri_fg_cnt = torch.sum(tri_rois_label.data.ne(0))
           bg_cnt = rois_label.data.numel() - fg_cnt
+          tri_bg_cnt = tri_rois_label.data.numel() -  tri_fg_cnt
 
         print("[session %d][epoch %2d][iter %4d/%4d] loss: %.4f, lr: %.2e" \
                                 % (args.session, epoch, step, iters_per_epoch, loss_temp, lr))
-        print("\t\t\tfg/bg=(%d/%d), time cost: %f" % (fg_cnt, bg_cnt, end-start))
-        print("\t\t\trpn_cls: %.4f, rpn_box: %.4f, rcnn_cls: %.4f, rcnn_box %.4f" \
-                      % (loss_rpn_cls, loss_rpn_box, loss_rcnn_cls, loss_rcnn_box))
+        print("\t\t\tfg/bg=(%d/%d),tri_fg/tri_bg=(%d/%d) time cost: %f" % (fg_cnt, bg_cnt,tri_fg_cnt, tri_bg_cnt, end-start))
+        print("\t\t\trpn_cls: %.4f, rpn_box: %.4f, rcnn_box %.4f, rcnn_cls_acc %.4f, triplet_loss %.4f" \
+                      % (loss_rpn_cls, loss_rpn_box, loss_rcnn_box, rcnn_cls_acc, loss_rcnn_triplet))
         if args.use_tfboard:
           info = {
             'loss': loss_temp,
             'loss_rpn_cls': loss_rpn_cls,
             'loss_rpn_box': loss_rpn_box,
-            'loss_rcnn_cls': loss_rcnn_cls,
-            'loss_rcnn_box': loss_rcnn_box
+            #'loss_rcnn_cls': loss_rcnn_cls,
+            'loss_rcnn_box': loss_rcnn_box,
+            'rcnn_cls_acc': rcnn_cls_acc,
+            'loss_rcnn_triplet': loss_rcnn_triplet
           }
           logger.add_scalars("logs_s_{}/losses".format(args.session), info, (epoch - 1) * iters_per_epoch + step)
 

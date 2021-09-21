@@ -40,20 +40,26 @@ class _ProposalTargetLayer(nn.Module):
         gt_boxes_append[:,:,1:5] = gt_boxes[:,:,:4]
 
         # Include ground-truth boxes in the set of candidate rois
+        #print('all_rois befor cat:{}'.format(all_rois.shape))
+        #all_rois befor cat:torch.Size([4, 2000, 5])
         all_rois = torch.cat([all_rois, gt_boxes_append], 1)
+        #print('all_rois after cat:{}'.format(all_rois.shape))
+        #all_rois after cat:torch.Size([4, 2020, 5])
 
         num_images = 1
+        #cfg.TRAIN.BATCH_SIZE = 128
         rois_per_image = int(cfg.TRAIN.BATCH_SIZE / num_images)
+        #cfg.TRAIN.FG_FRACTION = 0.25
         fg_rois_per_image = int(np.round(cfg.TRAIN.FG_FRACTION * rois_per_image))
         fg_rois_per_image = 1 if fg_rois_per_image == 0 else fg_rois_per_image
 
-        labels, rois, bbox_targets, bbox_inside_weights = self._sample_rois_pytorch(
+        labels, rois, bbox_targets, bbox_inside_weights, tri_labels, tri_rois = self._sample_rois_pytorch(
             all_rois, gt_boxes, fg_rois_per_image,
             rois_per_image, self._num_classes)
 
         bbox_outside_weights = (bbox_inside_weights > 0).float()
 
-        return rois, labels, bbox_targets, bbox_inside_weights, bbox_outside_weights
+        return rois, labels, bbox_targets, bbox_inside_weights, bbox_outside_weights, tri_labels, tri_rois
 
     def backward(self, top, propagate_down, bottom):
         """This layer does not propagate gradients."""
@@ -118,17 +124,29 @@ class _ProposalTargetLayer(nn.Module):
         examples.
         """
         # overlaps: (rois x gt_boxes)
+        # print('gt_box:{}'.format(gt_boxes.shape))
+        # gt_box:torch.Size([4, 20, 5])
 
         overlaps = bbox_overlaps_batch(all_rois, gt_boxes)
 
+        # print('overlaps:{}'.format(overlaps.shape))
+        # overlaps:torch.Size([4, 2020, 20])
+
         max_overlaps, gt_assignment = torch.max(overlaps, 2)
+        # print('max_overlaps:{}, gt_assignment:{}'.format(max_overlaps.shape, gt_assignment.shape))
+        # max_overlaps:torch.Size([4, 2020]), gt_assignment:torch.Size([4, 2020])
+        
 
         batch_size = overlaps.size(0)
         num_proposal = overlaps.size(1)
         num_boxes_per_img = overlaps.size(2)
 
         offset = torch.arange(0, batch_size)*gt_boxes.size(1)
+        # print('offset:{}'.format(offset.shape))
+        # offset:torch.Size([4])
         offset = offset.view(-1, 1).type_as(gt_assignment) + gt_assignment
+        # print('offset  :{}'.format(offset.shape))
+        # offset  :torch.Size([4, 2020])
 
         # changed indexing way for pytorch 1.0
         labels = gt_boxes[:,:,4].contiguous().view(-1)[(offset.view(-1),)].view(batch_size, -1)
@@ -136,6 +154,11 @@ class _ProposalTargetLayer(nn.Module):
         labels_batch = labels.new(batch_size, rois_per_image).zero_()
         rois_batch  = all_rois.new(batch_size, rois_per_image, 5).zero_()
         gt_rois_batch = all_rois.new(batch_size, rois_per_image, 5).zero_()
+
+        tri_labels_batch = labels.new(batch_size, cfg.TRAIN.TRIPLET_NUM_PER_IMG).zero_()
+        tri_rois_batch = all_rois.new(batch_size, cfg.TRAIN.TRIPLET_NUM_PER_IMG, 5).zero_()
+        tri_fg_rois_per_image = int(cfg.TRAIN.TRIPLET_NUM_PER_IMG * cfg.TRAIN.TRIPLET_FG_RATIO)
+        tri_rois_per_image = cfg.TRAIN.TRIPLET_NUM_PER_IMG
         # Guard against the case when an image has fewer than max_fg_rois_per_image
         # foreground RoIs
         for i in range(batch_size):
@@ -204,10 +227,76 @@ class _ProposalTargetLayer(nn.Module):
 
             gt_rois_batch[i] = gt_boxes[i][gt_assignment[i][keep_inds]]
 
+
+            # Sample fg rois with higher thresh to calculate triplet loss
+            
+            tri_fg_inds = torch.nonzero(max_overlaps[i] >= cfg.TRAIN.TRIPLET_FG_THRESH).view(-1)
+            tri_fg_num_rois = tri_fg_inds.numel()
+
+            tri_bg_inds = torch.nonzero((max_overlaps[i] < cfg.TRAIN.BG_THRESH_HI) &
+                                        (max_overlaps[i] >= cfg.TRAIN.BG_THRESH_LO)).view(-1)
+            tri_bg_num_rois = tri_bg_inds.numel()
+
+            
+
+            if tri_fg_num_rois > 0 and tri_bg_num_rois > 0:
+                tri_fg_rois_per_this_image = min(tri_fg_rois_per_image, tri_fg_num_rois)
+
+                rand_num = torch.from_numpy(np.random.permutation(tri_fg_num_rois)).type_as(gt_boxes).long()
+                
+                tri_fg_inds = tri_fg_inds[rand_num[:tri_fg_rois_per_this_image]]
+                
+                tri_bg_rois_per_this_image = tri_rois_per_image - tri_fg_rois_per_this_image
+
+                rand_num = np.floor(np.random.rand(tri_bg_rois_per_this_image) * tri_bg_num_rois)
+                rand_num = torch.from_numpy(rand_num).type_as(gt_boxes).long()
+                tri_bg_inds = tri_bg_inds[rand_num]
+
+            elif tri_bg_num_rois > 0 and tri_fg_num_rois == 0:
+                rand_num = np.floor(np.random.rand(tri_rois_per_image) * tri_fg_num_rois)
+                rand_num = torch.from_numpy(rand_num).type_as(gt_boxes).long()
+                tri_fg_inds = tri_fg_inds[rand_num]
+                tri_fg_rois_per_this_image = tri_rois_per_image
+                tri_bg_rois_per_this_image = 0
+            
+            elif tri_bg_num_rois > 0 and tri_fg_num_rois == 0:
+                rand_num = np.floor(np.random.rand(rois_per_image) * tri_bg_num_rois)
+                rand_num = torch.from_numpy(rand_num).type_as(gt_boxes).long()
+
+                tri_bg_inds = tri_bg_inds[rand_num]
+                tri_bg_rois_per_this_image = tri_rois_per_image
+                tri_fg_rois_per_this_image = 0
+            
+            else:
+                raise ValueError("tri_bg_num_rois = 0 and tri_fg_num_rois = 0, this should not happen!")
+            
+
+            #print('tri_fg:{}, tri_bg:{}'.format(tri_fg_inds.shape, tri_bg_inds.shape))
+            tri_keep_inds = torch.cat([tri_fg_inds, tri_bg_inds], 0)
+            #print('labels[i][tri_keep_inds]:{}'.format(labels[i][tri_keep_inds].shape))
+            tri_labels_batch[i].copy_(labels[i][tri_keep_inds])
+
+            if tri_fg_rois_per_this_image < tri_rois_per_image:
+                tri_labels_batch[i][tri_fg_rois_per_this_image:] = 0
+
+            tri_rois_batch[i] = all_rois[i][tri_keep_inds]
+            tri_rois_batch[i,:,0] = i
+
+            
+
+        # print('gt_rois_batch:{}'.format(gt_rois_batch.shape))
+        # gt_rois_batch:torch.Size([4, 128, 5])
+        # print('labels_batch:{}'.format(labels_batch.shape))
+        # labels_batch:torch.Size([4, 128])
+
         bbox_target_data = self._compute_targets_pytorch(
                 rois_batch[:,:,1:5], gt_rois_batch[:,:,:4])
+        # print('bbox_target_data:{}'.format(bbox_target_data.shape))
+        # bbox_target_data:torch.Size([4, 128, 4])
 
         bbox_targets, bbox_inside_weights = \
                 self._get_bbox_regression_labels_pytorch(bbox_target_data, labels_batch, num_classes)
+        # print('bbox_targets:{}'.format(bbox_targets.shape))
+        # bbox_targets:torch.Size([4, 128, 4])
 
-        return labels_batch, rois_batch, bbox_targets, bbox_inside_weights
+        return labels_batch, rois_batch, bbox_targets, bbox_inside_weights, tri_labels_batch, tri_rois_batch

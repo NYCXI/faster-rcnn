@@ -86,6 +86,16 @@ __C.TRAIN.FG_THRESH = 0.5
 __C.TRAIN.BG_THRESH_HI = 0.5
 __C.TRAIN.BG_THRESH_LO = 0.1
 
+# Overlap threshold for a ROI to be considered fg which is used to calculate TripletLoss
+__C.TRAIN.TRIPLET_FG_THRESH = 0.9
+
+# number of rois per img to compute tripletloss
+__C.TRAIN.TRIPLET_NUM_PER_IMG = 20
+
+# ratio of fg per img to compute tripletloss
+__C.TRAIN.TRIPLET_FG_RATIO = 0.8
+
+
 # Use horizontally-flipped images during training?
 __C.TRAIN.USE_FLIPPED = True
 
